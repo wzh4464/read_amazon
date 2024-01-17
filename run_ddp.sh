@@ -6,6 +6,7 @@ export MASTER_PORT=1234
 export WORLD_SIZE=8
 export NCLL_BLOCKING_WAIT=1
 export NCCL_TIMEOUT=200
+export OMP_NUM_THREADS=1
 
 /workspace/bert/bin/torchrun \
     --nnodes=1 \

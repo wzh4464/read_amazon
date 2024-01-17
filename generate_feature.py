@@ -29,23 +29,44 @@ from torch.utils.data.distributed import DistributedSampler
 # 初始化分布式环境
 
 
+def download_nltk_resources(resource_name, download_dir):
+    import os
+    if not os.path.isdir(download_dir):
+        os.makedirs(download_dir)
+    nltk.download(resource_name, download_dir=download_dir)
+
+
 def setup(rank, world_size):
-    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=world_size)
+    
+    print(f"rank: {rank}, world_size: {world_size}")
+    dist.init_process_group(
+        backend='nccl', rank=rank, world_size=world_size)
+    
+    nltk_data_path = "/workspace/nltk_data"
+    if rank == 0:
+        # 主进程下载资源 if not exists
+        if not os.path.isdir(nltk_data_path):
+            os.makedirs(nltk_data_path)
+            download_nltk_resources('punkt', nltk_data_path)
+            download_nltk_resources('stopwords', nltk_data_path)
+        else:
+            print("nltk_data_path already exists")
+
+    # 同步所有进程，确保主进程下载完成
+    dist.barrier()
+
 
 def cleanup():
     dist.destroy_process_group()
 
 
-# 安装所需库（如果尚未安装）
-# !pip install transformers nltk
-
-
-
 def preprocess_text(text):
+    stop_words = set(stopwords.words('english'))
     # 基本文本清洗和去除停止词
     text = re.sub(r'[^\w\s]', '', text.lower())
     words = word_tokenize(text)
     return ' '.join([word for word in words if word not in stop_words])
+
 
 class ReviewDataset(Dataset):
     def __init__(self, reviews, tokenizer, max_len=512):
@@ -76,9 +97,72 @@ class ReviewDataset(Dataset):
         }
 
 
+def main(rank, world_size):
+    setup(rank, world_size)
+
+    import os
+    if rank == 0:
+        if not os.path.isfile('/workspace/preprocessed_reviews.json'):
+            # 加载数据
+            with open('/workspace/combined_reviews.json', 'r', encoding='utf-8') as file:
+                reviews = [json.loads(line)['reviewText'] for line in file]
+
+            # 预处理文本
+            preprocessed_reviews = [preprocess_text(review) for review in reviews]
+            # save preprocessed_reviews
+            with open('/workspace/preprocessed_reviews.json', 'w', encoding='utf-8') as file:
+                for review in preprocessed_reviews:
+                    file.write(review + '\n')
+        else:
+            with open('/workspace/preprocessed_reviews.json', 'r', encoding='utf-8') as file:
+                preprocessed_reviews = [line.strip()
+                                        for line in file.readlines()]
+
+    dist.barrier()
+
+    if rank != 0:
+        with open('/workspace/preprocessed_reviews.json', 'r', encoding='utf-8') as file:
+            preprocessed_reviews = [line.strip()
+                                    for line in file.readlines()]
+
+    # 初始化 BERT 模型和分词器
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertModel.from_pretrained('bert-base-uncased')
+
+    # 将模型设置为评估模式并转移到对应的 GPU
+    model.eval()
+    model.to(rank)
+
+    # 包装模型以进行分布式训练
+    model = DDP(model, device_ids=[rank])
+
+    # 创建数据集和 DataLoader
+    dataset = ReviewDataset(preprocessed_reviews, tokenizer)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    dataloader = DataLoader(dataset, batch_size=16, sampler=sampler)
+
+    print(f"开始生成特征向量 on rank {rank}")
+
+    all_feature_vectors = []
+
+    # 向量化评论
+    with torch.no_grad():
+        for data in dataloader:
+            ids = data['ids'].to(rank, dtype=torch.long)
+            mask = data['mask'].to(rank, dtype=torch.long)
+
+            outputs = model(ids, attention_mask=mask)
+            features = outputs[0][:, 0, :].cpu()
+            all_feature_vectors.append(features)
+
+    all_feature = torch.cat(all_feature_vectors, dim=0)
+    torch.save(all_feature, f"/workspace/all_feature_{rank}.pt")
+
+    cleanup()
+
 if __name__ == "__main__":
-    # load rank from env
     import os
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
-    print(f"rank: {rank}, world_size: {world_size}")
+    # print(f"rank: {rank}, world_size: {world_size}")
+    main(rank, world_size)
