@@ -25,6 +25,7 @@ import re
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import numpy as np
 
 # 初始化分布式环境
 
@@ -102,25 +103,35 @@ def main(rank, world_size):
 
     import os
     if rank == 0:
-        if not os.path.isfile('/workspace/preprocessed_reviews.json'):
-            # 加载数据
-            with open('/workspace/combined_reviews.json', 'r', encoding='utf-8') as file:
-                reviews = [json.loads(line)['reviewText'] for line in file]
+        # 主进程：读取数据
+        print("主进程：读取数据")
+        with open('/workspace/combined_reviews_with_category.json', 'r', encoding='utf-8') as file:
+            data = [json.loads(line) for line in file]
+            reviews = [item['reviewText'] for item in data]
+            categories = [item['category'] for item in data]
 
-            # 预处理文本
-            preprocessed_reviews = [preprocess_text(review) for review in reviews]
-            # save preprocessed_reviews
-            with open('/workspace/preprocessed_reviews.json', 'w', encoding='utf-8') as file:
-                for review in preprocessed_reviews:
-                    file.write(review + '\n')
-        else:
-            with open('/workspace/preprocessed_reviews.json', 'r', encoding='utf-8') as file:
-                preprocessed_reviews = [line.strip()
-                                        for line in file.readlines()]
+        # 创建类别到数字的映射
+        unique_categories = list(set(categories))
+        category_to_id = {category: idx for idx, category in enumerate(unique_categories)}
+
+        # 转换类别为数字标签
+        numeric_labels = [category_to_id[category] for category in categories]
+
+        # 预处理文本
+        preprocessed_reviews = [preprocess_text(review) for review in reviews]
+        # Save preprocessed reviews and numeric labels
+        with open('/workspace/preprocessed_reviews.json', 'w', encoding='utf-8') as file:
+            for review in preprocessed_reviews:
+                file.write(review + '\n')
+
+        with open('/workspace/doc_labels.txt', 'w', encoding='utf-8') as file:
+            for label in numeric_labels:
+                file.write(str(label) + '\n')
 
     dist.barrier()
 
     if rank != 0:
+        print(f"从主进程读取数据 on rank {rank}")
         with open('/workspace/preprocessed_reviews.json', 'r', encoding='utf-8') as file:
             preprocessed_reviews = [line.strip()
                                     for line in file.readlines()]
@@ -157,6 +168,22 @@ def main(rank, world_size):
 
     all_feature = torch.cat(all_feature_vectors, dim=0)
     torch.save(all_feature, f"/workspace/all_feature_{rank}.pt")
+
+    dist.barrier()
+
+    if rank == 0:
+        # 主进程：读取所有特征向量文件并合并
+        all_features = []
+        for r in range(world_size):
+            feature_part = torch.load(f"/workspace/all_feature_{r}.pt")
+            all_features.append(feature_part)
+
+        # 合并所有特征向量
+        combined_features = torch.cat(all_features, dim=0)
+        combined_features_np = combined_features.numpy()
+
+        # 保存 NumPy 矩阵
+        np.save('/workspace/feature_matrix.npy', combined_features_np)
 
     cleanup()
 
