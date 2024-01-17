@@ -47,16 +47,6 @@ def preprocess_text(text):
     words = word_tokenize(text)
     return ' '.join([word for word in words if word not in stop_words])
 
-
-
-
-# 初始化 BERT 模型和分词器
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertModel.from_pretrained('bert-base-uncased')
-
-# 将模型设置为评估模式
-model.eval()
-
 class ReviewDataset(Dataset):
     def __init__(self, reviews, tokenizer, max_len=512):
         self.reviews = reviews
@@ -86,57 +76,9 @@ class ReviewDataset(Dataset):
         }
 
 
-def main(rank, world_size):
-
-    # 加载停止词
-    nltk.download('punkt')
-    nltk.download('stopwords')
-    stop_words = set(stopwords.words('english'))
-
-
-        # 加载数据
-    with open('/workspace/combined_reviews.json', 'r', encoding='utf-8') as file:
-        reviews = [json.loads(line)['reviewText'] for line in file]
-
-    # 预处理文本
-    preprocessed_reviews = [preprocess_text(review) for review in reviews]
-
-    setup(rank, world_size)
-
-    # 初始化 BERT 模型和分词器
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertModel.from_pretrained('bert-base-uncased')
-
-    # 将模型设置为评估模式并转移到对应的 GPU
-    model.eval()
-    model.to(rank)
-
-    # 包装模型以进行分布式训练
-    model = DDP(model, device_ids=[rank])
-
-    # 创建数据集和 DataLoader
-    dataset = ReviewDataset(preprocessed_reviews, tokenizer)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    dataloader = DataLoader(dataset, batch_size=16, sampler=sampler)
-
-    all_feature_vectors = []
-
-    # 向量化评论
-    with torch.no_grad():
-        for data in dataloader:
-            ids = data['ids'].to(rank, dtype=torch.long)
-            mask = data['mask'].to(rank, dtype=torch.long)
-
-            outputs = model(ids, attention_mask=mask)
-            features = outputs[0][:, 0, :].cpu()
-            all_feature_vectors.append(features)
-
-    all_feature = torch.cat(all_feature_vectors, dim=0)
-    torch.save(all_feature, '/workspace/all_feature.pt')
-
-    cleanup()
-
-
-if __name__ == "main":
-    world_size = torch.cuda.device_count()
-    torch.multiprocessing.spawn(main, args=(world_size,), nprocs=world_size)
+if __name__ == "__main__":
+    # load rank from env
+    import os
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    print(f"rank: {rank}, world_size: {world_size}")
